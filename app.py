@@ -5,6 +5,7 @@ import json
 import os
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 import numpy as np
 import pandas as pd
@@ -159,7 +160,7 @@ def _make_client(api_key, base_url):
     return OpenAI(api_key=api_key, base_url=base_url, timeout=_timeout(), max_retries=0)
 
 
-def _translate_openai_error(exc: Exception) -> Exception:
+def _translate_openai_error(exc: Exception, base_url: str = "") -> Exception:
     """Map OpenAI-SDK exceptions to short, actionable messages."""
     from openai import (
         APIConnectionError,
@@ -183,10 +184,20 @@ def _translate_openai_error(exc: Exception) -> Exception:
     if isinstance(exc, RateLimitError):
         return RuntimeError("ArvanCloud rate limit or account quota reached. Check your gateway quota and try again later.")
     if isinstance(exc, APITimeoutError):  # must come before APIConnectionError (it is a subclass)
+        host = urlparse(base_url).hostname or "the gateway"
+        cause = type(exc.__cause__).__name__ if exc.__cause__ is not None else ""
+        if "Connect" in cause:
+            # The TCP/TLS connection was never established: wrong URL, firewall/geo-block, or host down.
+            return RuntimeError(
+                f"Could not open a connection to {host} within {GATEWAY_CONNECT_TIMEOUT_S:.0f}s per attempt. "
+                "The server never answered the connection request, so this is a URL or network problem, "
+                "not a slow model. Check the gateway URL against your ArvanCloud endpoint page, and check that "
+                "the machine running Streamlit can reach it."
+            )
         return RuntimeError(
-            "The gateway accepted the connection but sent nothing for "
-            f"{GATEWAY_READ_TIMEOUT_S:.0f}s. The model may be overloaded or a slow 'reasoning' model. "
-            "Use 'Test gateway connection' below, or try a faster model."
+            f"{host} accepted the connection but sent nothing for {GATEWAY_READ_TIMEOUT_S:.0f}s. "
+            "The model may be overloaded or a slow 'reasoning' model. "
+            "Use 'Test gateway connection', or try a faster model."
         )
     if isinstance(exc, APIConnectionError):
         return RuntimeError(
@@ -212,7 +223,7 @@ def ping_gateway(api_key, base_url, model_name) -> float:
             max_tokens=8,
         )
     except OpenAIError as exc:
-        raise _translate_openai_error(exc) from exc
+        raise _translate_openai_error(exc, base_url) from exc
     return time.time() - started
 
 
@@ -321,7 +332,7 @@ RETURN THESE SECTIONS:
             if choice.finish_reason:
                 finish_reason = choice.finish_reason
     except OpenAIError as exc:
-        raise _translate_openai_error(exc) from exc
+        raise _translate_openai_error(exc, base_url) from exc
 
     if not produced:
         raise RuntimeError(
@@ -391,6 +402,13 @@ def main():
             config_value("OPENAI_BASE_URL", ""),
         )
         
+        if "arvancloudai.ir" in base_url and "/gateway/models/" not in base_url:
+            st.warning(
+                "This doesn't look like the documented ArvanCloud format "
+                "`https://arvancloudai.ir/gateway/models/<Model>/<id>/v1`. "
+                "Copy the exact URL from your endpoint page in the ArvanCloud AI service."
+            )
+
         model_name = st.text_input(
             "Model identifier",
             config_value("OPENAI_MODEL", ""),
