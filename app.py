@@ -112,56 +112,384 @@ def load_builtin(name: str) -> pd.DataFrame:
     return normalize_columns(pd.read_excel(workbook, engine="openpyxl"))
 
 
-def call_synthesis(candidate, df, vectors, api_key, base_url, model_name, temperature, perspective):
-    from openai import OpenAI
-    z = np.asarray(candidate["vector"]).reshape(1, -1)
+
+def call_synthesis(
+    candidate,
+    df,
+    vectors,
+    api_key,
+    base_url,
+    model_name,
+    temperature,
+    perspective,
+):
+    from openai import (
+        OpenAI,
+        APIConnectionError,
+        APITimeoutError,
+        AuthenticationError,
+        BadRequestError,
+        NotFoundError,
+        RateLimitError,
+        APIStatusError,
+    )
+
+    # Validate configuration before making a network request.
+    api_key = (api_key or "").strip()
+    base_url = (base_url or "").strip().rstrip("/")
+    model_name = (model_name or "").strip()
+
+    if not api_key:
+        raise ValueError("API key is missing. Configure OPENAI_API_KEY in Streamlit Secrets.")
+
+    if not base_url:
+        raise ValueError("API base URL is missing. Configure OPENAI_BASE_URL.")
+
+    if not model_name:
+        raise ValueError("Model name is missing. Configure OPENAI_MODEL.")
+
+    # ArvanCloud's documented OpenAI SDK example uses this key format.
+    if not api_key.startswith("apikey "):
+        raise ValueError(
+            "The ArvanCloud API key should include its 'apikey ' prefix. "
+            "Copy the complete key from your ArvanCloud AI gateway."
+        )
+
+    # Find the six nearest original ideas to the generated candidate.
+    z = np.asarray(candidate["vector"], dtype=np.float32).reshape(1, -1)
     sims = cosine_similarity(z, vectors)[0]
     nearest = np.argsort(sims)[::-1][:6]
+
     anchors = []
     for idx in nearest:
         row = df.iloc[int(idx)]
-        anchors.append({field: row[field] for field in FIELDS} | {"similarity": round(float(sims[idx]), 3)})
-    client = OpenAI(
-        api_key=api_key or "local-compatible",
-        base_url=base_url,
-        timeout=180.0,
-        max_retries=2,
-    )
-    prompt = f"""You are an interdisciplinary scientific invention researcher.
-The task is to formulate one scientifically explicit candidate inspired by a mathematical search operation.
+        anchors.append({
+            field: row[field]
+            for field in FIELDS
+        } | {
+            "similarity": round(float(sims[idx]), 3)
+        })
 
-Search operation: {candidate['method']}
-Perspective: {perspective}
-Nearest source ideas (anchors, not templates):
+    prompt = f"""
+You are an interdisciplinary scientific invention researcher.
+
+Your task is to formulate one scientifically explicit research hypothesis
+inspired by a mathematical semantic-search operation.
+
+SEARCH OPERATION:
+{candidate['method']}
+
+INTELLECTUAL PERSPECTIVE:
+{perspective}
+
+NEAREST SOURCE IDEAS:
 {json.dumps(anchors, ensure_ascii=False, indent=2)}
 
-Requirements:
-- Do not merely paraphrase or concatenate source ideas.
-- Transfer an underlying mechanism, mathematical principle, control strategy, biological process, or information-processing idea.
-- Explain the causal/mechanistic chain connecting the source principle to the target problem.
-- State what is established science versus speculative extrapolation.
-- Do not claim patentability, global novelty, clinical efficacy, or safety without evidence.
-- For healthcare ideas, include privacy, human-factors, clinical-governance, and safety considerations where relevant.
+REQUIREMENTS:
 
-Return a structured response with: title, target_problem, transferred_mechanism, proposed_idea, why_it_may_be_different, scientific_basis, speculative_assumptions, implementation_steps (3-5), risks_and_safeguards, validation_experiment, measurable_outcomes, and novelty_verification_queries.
+1. Do not merely paraphrase, combine, or concatenate the source ideas.
+2. Identify an underlying mechanism, mathematical principle, biological
+   process, control strategy, or information-processing principle.
+3. Transfer that principle into a meaningfully different target problem.
+4. Explain the causal chain connecting the transferred mechanism
+   to the proposed application.
+5. Distinguish established scientific knowledge from speculation.
+6. Explain why the proposed mechanism may be different from the source ideas.
+7. Do not claim patentability, global novelty, clinical efficacy,
+   or safety without evidence.
+8. For healthcare applications, discuss privacy, human factors,
+   clinical governance, and safety where relevant.
+9. Make the proposal technically specific rather than generic.
+
+RETURN THESE SECTIONS:
+
+# Title
+# Target Problem
+# Transferred Mechanism
+# Proposed Idea
+# Why It May Be Different
+# Scientific Basis
+# Speculative Assumptions
+# Implementation Steps (3-5 steps)
+# Risks and Safeguards
+# Validation Experiment
+# Measurable Outcomes
+# Novelty Verification Queries
 """
-    response = client.chat.completions.create(
-        model=model_name,
-        messages=[
-            {
-                "role": "system",
-                "content": "Be rigorous, inventive, explicit about uncertainty, and avoid unsupported claims."
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-        temperature=float(temperature),
-        top_p=0.95,
-        max_tokens=1800,
+
+    client = OpenAI(
+        api_key=api_key,
+        base_url=base_url,
+        timeout=120.0,
+        max_retries=1,
     )
-    return response.choices[0].message.content or "No content returned."
+
+    try:
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Be rigorous, inventive, technically explicit, "
+                        "and transparent about scientific uncertainty."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
+            temperature=float(temperature),
+            max_tokens=3000,
+        )
+
+    except AuthenticationError as exc:
+        raise RuntimeError(
+            "ArvanCloud authentication failed. Check the complete API key "
+            "and its 'apikey ' prefix."
+        ) from exc
+
+    except NotFoundError as exc:
+        raise RuntimeError(
+            "The requested model or gateway endpoint was not found. "
+            "Check OPENAI_BASE_URL and OPENAI_MODEL."
+        ) from exc
+
+    except BadRequestError as exc:
+        raise RuntimeError(
+            f"The provider rejected the request. Check the model name "
+            f"and supported request parameters. Details: {exc}"
+        ) from exc
+
+    except RateLimitError as exc:
+        raise RuntimeError(
+            "ArvanCloud rate limit or account quota reached. "
+            "Check your gateway quota and try again later."
+        ) from exc
+
+    except APITimeoutError as exc:
+        raise RuntimeError(
+            "The synthesis request timed out. Try again or check "
+            "the gateway's availability."
+        ) from exc
+
+    except APIConnectionError as exc:
+        raise RuntimeError(
+            "Could not connect to the ArvanCloud gateway. "
+            "Check the base URL and network availability."
+        ) from exc
+
+    except APIStatusError as exc:
+        raise RuntimeError(
+            f"Provider returned HTTP {exc.status_code}. "
+            f"Details: {exc}"
+        ) from exc
+
+    if not response.choices:
+        raise RuntimeError("The provider returned no completion choices.")
+
+    content = response.choices[0].message.content
+
+    if not content or not content.strip():
+        raise RuntimeError(
+            "The model returned an empty response. "
+            "Try another model or check the gateway configuration."
+        )
+
+    if response.choices[0].finish_reason == "length":
+        content += "\n\n> **Note:** The response reached the token limit and may be incomplete."
+
+    return content.strip()
+
+def call_synthesis(
+    candidate,
+    df,
+    vectors,
+    api_key,
+    base_url,
+    model_name,
+    temperature,
+    perspective,
+):
+    from openai import (
+        OpenAI,
+        APIConnectionError,
+        APITimeoutError,
+        AuthenticationError,
+        BadRequestError,
+        NotFoundError,
+        RateLimitError,
+        APIStatusError,
+    )
+
+    # Validate configuration before making a network request.
+    api_key = (api_key or "").strip()
+    base_url = (base_url or "").strip().rstrip("/")
+    model_name = (model_name or "").strip()
+
+    if not api_key:
+        raise ValueError("API key is missing. Configure OPENAI_API_KEY in Streamlit Secrets.")
+
+    if not base_url:
+        raise ValueError("API base URL is missing. Configure OPENAI_BASE_URL.")
+
+    if not model_name:
+        raise ValueError("Model name is missing. Configure OPENAI_MODEL.")
+
+    # ArvanCloud's documented OpenAI SDK example uses this key format.
+    if not api_key.startswith("apikey "):
+        raise ValueError(
+            "The ArvanCloud API key should include its 'apikey ' prefix. "
+            "Copy the complete key from your ArvanCloud AI gateway."
+        )
+
+    # Find the six nearest original ideas to the generated candidate.
+    z = np.asarray(candidate["vector"], dtype=np.float32).reshape(1, -1)
+    sims = cosine_similarity(z, vectors)[0]
+    nearest = np.argsort(sims)[::-1][:6]
+
+    anchors = []
+    for idx in nearest:
+        row = df.iloc[int(idx)]
+        anchors.append({
+            field: row[field]
+            for field in FIELDS
+        } | {
+            "similarity": round(float(sims[idx]), 3)
+        })
+
+    prompt = f"""
+You are an interdisciplinary scientific invention researcher.
+
+Your task is to formulate one scientifically explicit research hypothesis
+inspired by a mathematical semantic-search operation.
+
+SEARCH OPERATION:
+{candidate['method']}
+
+INTELLECTUAL PERSPECTIVE:
+{perspective}
+
+NEAREST SOURCE IDEAS:
+{json.dumps(anchors, ensure_ascii=False, indent=2)}
+
+REQUIREMENTS:
+
+1. Do not merely paraphrase, combine, or concatenate the source ideas.
+2. Identify an underlying mechanism, mathematical principle, biological
+   process, control strategy, or information-processing principle.
+3. Transfer that principle into a meaningfully different target problem.
+4. Explain the causal chain connecting the transferred mechanism
+   to the proposed application.
+5. Distinguish established scientific knowledge from speculation.
+6. Explain why the proposed mechanism may be different from the source ideas.
+7. Do not claim patentability, global novelty, clinical efficacy,
+   or safety without evidence.
+8. For healthcare applications, discuss privacy, human factors,
+   clinical governance, and safety where relevant.
+9. Make the proposal technically specific rather than generic.
+
+RETURN THESE SECTIONS:
+
+# Title
+# Target Problem
+# Transferred Mechanism
+# Proposed Idea
+# Why It May Be Different
+# Scientific Basis
+# Speculative Assumptions
+# Implementation Steps (3-5 steps)
+# Risks and Safeguards
+# Validation Experiment
+# Measurable Outcomes
+# Novelty Verification Queries
+"""
+
+    client = OpenAI(
+        api_key=api_key,
+        base_url=base_url,
+        timeout=120.0,
+        max_retries=1,
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Be rigorous, inventive, technically explicit, "
+                        "and transparent about scientific uncertainty."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
+            temperature=float(temperature),
+            max_tokens=3000,
+        )
+
+    except AuthenticationError as exc:
+        raise RuntimeError(
+            "ArvanCloud authentication failed. Check the complete API key "
+            "and its 'apikey ' prefix."
+        ) from exc
+
+    except NotFoundError as exc:
+        raise RuntimeError(
+            "The requested model or gateway endpoint was not found. "
+            "Check OPENAI_BASE_URL and OPENAI_MODEL."
+        ) from exc
+
+    except BadRequestError as exc:
+        raise RuntimeError(
+            f"The provider rejected the request. Check the model name "
+            f"and supported request parameters. Details: {exc}"
+        ) from exc
+
+    except RateLimitError as exc:
+        raise RuntimeError(
+            "ArvanCloud rate limit or account quota reached. "
+            "Check your gateway quota and try again later."
+        ) from exc
+
+    except APITimeoutError as exc:
+        raise RuntimeError(
+            "The synthesis request timed out. Try again or check "
+            "the gateway's availability."
+        ) from exc
+
+    except APIConnectionError as exc:
+        raise RuntimeError(
+            "Could not connect to the ArvanCloud gateway. "
+            "Check the base URL and network availability."
+        ) from exc
+
+    except APIStatusError as exc:
+        raise RuntimeError(
+            f"Provider returned HTTP {exc.status_code}. "
+            f"Details: {exc}"
+        ) from exc
+
+    if not response.choices:
+        raise RuntimeError("The provider returned no completion choices.")
+
+    content = response.choices[0].message.content
+
+    if not content or not content.strip():
+        raise RuntimeError(
+            "The model returned an empty response. "
+            "Try another model or check the gateway configuration."
+        )
+
+    if response.choices[0].finish_reason == "length":
+        content += "\n\n> **Note:** The response reached the token limit and may be incomplete."
+
+    return content.strip()
 
 
 def main():
@@ -208,10 +536,34 @@ def main():
         st.divider()
         st.header("4 · LLM synthesis (optional)")
         use_llm = st.checkbox("Enable scientific idea synthesis", value=False)
-        base_url = st.text_input("OpenAI-compatible base URL", config_value("OPENAI_BASE_URL", "https://api.openai.com/v1"))
-        model_name = st.text_input("Chat model", config_value("OPENAI_MODEL", "gpt-4o-mini"))
-        api_key = st.text_input("API key", config_value("OPENAI_API_KEY", ""), type="password")
-        temperature = st.slider("Creativity temperature", 0.0, 1.5, 1.15, 0.05)
+
+        st.caption("Configure your ArvanCloud AI gateway.")
+        
+        base_url = st.text_input(
+            "ArvanCloud gateway URL",
+            config_value("OPENAI_BASE_URL", ""),
+        )
+        
+        model_name = st.text_input(
+            "Model identifier",
+            config_value("OPENAI_MODEL", ""),
+        )
+        
+        api_key = st.text_input(
+            "ArvanCloud API key",
+            config_value("OPENAI_API_KEY", ""),
+            type="password",
+            help="Enter the complete key, including the 'apikey ' prefix.",
+        )
+        
+        temperature = st.slider(
+            "Creativity temperature",
+            0.0,
+            1.5,
+            0.9,
+            0.05,
+        )
+
 
     with st.spinner("Constructing semantic representations..."):
         vectors = encode_dataset(df, view_mode, weights)
