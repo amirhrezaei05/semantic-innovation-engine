@@ -121,7 +121,12 @@ def call_synthesis(candidate, df, vectors, api_key, base_url, model_name, temper
     for idx in nearest:
         row = df.iloc[int(idx)]
         anchors.append({field: row[field] for field in FIELDS} | {"similarity": round(float(sims[idx]), 3)})
-    client = OpenAI(api_key=api_key or "local-compatible", base_url=base_url)
+    client = OpenAI(
+        api_key=api_key or "local-compatible",
+        base_url=base_url,
+        timeout=180.0,
+        max_retries=2,
+    )
     prompt = f"""You are an interdisciplinary scientific invention researcher.
 The task is to formulate one scientifically explicit candidate inspired by a mathematical search operation.
 
@@ -142,10 +147,19 @@ Return a structured response with: title, target_problem, transferred_mechanism,
 """
     response = client.chat.completions.create(
         model=model_name,
-        messages=[{"role": "system", "content": "Be rigorous, inventive, explicit about uncertainty, and avoid unsupported claims."},
-                  {"role": "user", "content": prompt}],
+        messages=[
+            {
+                "role": "system",
+                "content": "Be rigorous, inventive, explicit about uncertainty, and avoid unsupported claims."
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
         temperature=float(temperature),
         top_p=0.95,
+        max_tokens=1800,
     )
     return response.choices[0].message.content or "No content returned."
 
