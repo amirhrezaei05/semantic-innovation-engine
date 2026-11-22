@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from pathlib import Path
 
 import numpy as np
@@ -113,7 +114,109 @@ def load_builtin(name: str) -> pd.DataFrame:
 
 
 
-def call_synthesis(
+# Network behaviour for the LLM gateway. These are *per-phase* limits, not one big total.
+# READ = max silence between two chunks of the response; with streaming it only has to cover the
+# wait for the first token, not the whole generation.
+GATEWAY_CONNECT_TIMEOUT_S = 15.0
+GATEWAY_READ_TIMEOUT_S = 90.0
+
+
+def _timeout(connect: float | None = None, read: float | None = None):
+    # openai.Timeout exists in old (1.x) and new SDK versions, so no direct HTTP-library import is needed.
+    from openai import Timeout
+
+    c = GATEWAY_CONNECT_TIMEOUT_S if connect is None else connect
+    r = GATEWAY_READ_TIMEOUT_S if read is None else read
+    return Timeout(connect=c, read=r, write=15.0, pool=15.0)
+
+
+def _clean_gateway_config(api_key, base_url, model_name):
+    """Validate and normalise gateway settings before any network request."""
+    api_key = (api_key or "").strip()
+    base_url = (base_url or "").strip().rstrip("/")
+    model_name = (model_name or "").strip()
+
+    if not api_key:
+        raise ValueError("API key is missing. Configure OPENAI_API_KEY in Streamlit Secrets.")
+    if not base_url:
+        raise ValueError("API base URL is missing. Configure OPENAI_BASE_URL.")
+    if not model_name:
+        raise ValueError("Model name is missing. Configure OPENAI_MODEL.")
+    # ArvanCloud's documented OpenAI SDK example uses this key format.
+    if not api_key.startswith("apikey "):
+        raise ValueError(
+            "The ArvanCloud API key should include its 'apikey ' prefix. "
+            "Copy the complete key from your ArvanCloud AI gateway."
+        )
+    return api_key, base_url, model_name
+
+
+def _make_client(api_key, base_url):
+    from openai import OpenAI
+
+    # max_retries=0: the SDK's silent retry used to re-send the whole request after a timeout,
+    # doubling the wait (and the generation cost) with no feedback in the UI.
+    return OpenAI(api_key=api_key, base_url=base_url, timeout=_timeout(), max_retries=0)
+
+
+def _translate_openai_error(exc: Exception) -> Exception:
+    """Map OpenAI-SDK exceptions to short, actionable messages."""
+    from openai import (
+        APIConnectionError,
+        APIStatusError,
+        APITimeoutError,
+        AuthenticationError,
+        BadRequestError,
+        NotFoundError,
+        RateLimitError,
+    )
+
+    if isinstance(exc, AuthenticationError):
+        return RuntimeError("ArvanCloud authentication failed. Check the complete API key and its 'apikey ' prefix.")
+    if isinstance(exc, NotFoundError):
+        return RuntimeError("The requested model or gateway endpoint was not found. Check OPENAI_BASE_URL and OPENAI_MODEL.")
+    if isinstance(exc, BadRequestError):
+        return RuntimeError(
+            "The provider rejected the request. Check the model name and supported request parameters. "
+            f"Details: {exc}"
+        )
+    if isinstance(exc, RateLimitError):
+        return RuntimeError("ArvanCloud rate limit or account quota reached. Check your gateway quota and try again later.")
+    if isinstance(exc, APITimeoutError):  # must come before APIConnectionError (it is a subclass)
+        return RuntimeError(
+            "The gateway accepted the connection but sent nothing for "
+            f"{GATEWAY_READ_TIMEOUT_S:.0f}s. The model may be overloaded or a slow 'reasoning' model. "
+            "Use 'Test gateway connection' below, or try a faster model."
+        )
+    if isinstance(exc, APIConnectionError):
+        return RuntimeError(
+            "Could not connect to the ArvanCloud gateway. Check the base URL and network availability "
+            "(the host running Streamlit must be able to reach it)."
+        )
+    if isinstance(exc, APIStatusError):
+        return RuntimeError(f"Provider returned HTTP {exc.status_code}. Details: {exc}")
+    return exc
+
+
+def ping_gateway(api_key, base_url, model_name) -> float:
+    """Tiny request that separates 'gateway unreachable / wrong config' from 'model is just slow'."""
+    from openai import OpenAIError
+
+    api_key, base_url, model_name = _clean_gateway_config(api_key, base_url, model_name)
+    client = _make_client(api_key, base_url).with_options(timeout=_timeout(connect=20.0, read=20.0))
+    started = time.time()
+    try:
+        client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": "Reply with the single word: ok"}],
+            max_tokens=8,
+        )
+    except OpenAIError as exc:
+        raise _translate_openai_error(exc) from exc
+    return time.time() - started
+
+
+def stream_synthesis(
     candidate,
     df,
     vectors,
@@ -123,37 +226,15 @@ def call_synthesis(
     temperature,
     perspective,
 ):
-    from openai import (
-        OpenAI,
-        APIConnectionError,
-        APITimeoutError,
-        AuthenticationError,
-        BadRequestError,
-        NotFoundError,
-        RateLimitError,
-        APIStatusError,
-    )
+    """Generator yielding the hypothesis text as the model produces it.
 
-    # Validate configuration before making a network request.
-    api_key = (api_key or "").strip()
-    base_url = (base_url or "").strip().rstrip("/")
-    model_name = (model_name or "").strip()
+    Streaming means the person sees output immediately instead of a spinner for the whole
+    generation, and the timeout only has to cover time-to-first-token / gaps between chunks.
+    Use with ``st.write_stream``.
+    """
+    from openai import OpenAIError
 
-    if not api_key:
-        raise ValueError("API key is missing. Configure OPENAI_API_KEY in Streamlit Secrets.")
-
-    if not base_url:
-        raise ValueError("API base URL is missing. Configure OPENAI_BASE_URL.")
-
-    if not model_name:
-        raise ValueError("Model name is missing. Configure OPENAI_MODEL.")
-
-    # ArvanCloud's documented OpenAI SDK example uses this key format.
-    if not api_key.startswith("apikey "):
-        raise ValueError(
-            "The ArvanCloud API key should include its 'apikey ' prefix. "
-            "Copy the complete key from your ArvanCloud AI gateway."
-        )
+    api_key, base_url, model_name = _clean_gateway_config(api_key, base_url, model_name)
 
     # Find the six nearest original ideas to the generated candidate.
     z = np.asarray(candidate["vector"], dtype=np.float32).reshape(1, -1)
@@ -163,12 +244,7 @@ def call_synthesis(
     anchors = []
     for idx in nearest:
         row = df.iloc[int(idx)]
-        anchors.append({
-            field: row[field]
-            for field in FIELDS
-        } | {
-            "similarity": round(float(sims[idx]), 3)
-        })
+        anchors.append({field: row[field] for field in FIELDS} | {"similarity": round(float(sims[idx]), 3)})
 
     prompt = f"""
 You are an interdisciplinary scientific invention researcher.
@@ -217,279 +293,50 @@ RETURN THESE SECTIONS:
 # Novelty Verification Queries
 """
 
-    client = OpenAI(
-        api_key=api_key,
-        base_url=base_url,
-        timeout=120.0,
-        max_retries=1,
-    )
-
+    client = _make_client(api_key, base_url)
+    produced = False
+    finish_reason = None
     try:
-        response = client.chat.completions.create(
+        stream = client.chat.completions.create(
             model=model_name,
             messages=[
                 {
                     "role": "system",
-                    "content": (
-                        "Be rigorous, inventive, technically explicit, "
-                        "and transparent about scientific uncertainty."
-                    ),
+                    "content": "Be rigorous, inventive, technically explicit, and transparent about scientific uncertainty.",
                 },
-                {
-                    "role": "user",
-                    "content": prompt,
-                },
+                {"role": "user", "content": prompt},
             ],
             temperature=float(temperature),
             max_tokens=3000,
+            stream=True,
         )
+        for chunk in stream:
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            piece = getattr(choice.delta, "content", None)
+            if piece:
+                produced = True
+                yield piece
+            if choice.finish_reason:
+                finish_reason = choice.finish_reason
+    except OpenAIError as exc:
+        raise _translate_openai_error(exc) from exc
 
-    except AuthenticationError as exc:
+    if not produced:
         raise RuntimeError(
-            "ArvanCloud authentication failed. Check the complete API key "
-            "and its 'apikey ' prefix."
-        ) from exc
-
-    except NotFoundError as exc:
-        raise RuntimeError(
-            "The requested model or gateway endpoint was not found. "
-            "Check OPENAI_BASE_URL and OPENAI_MODEL."
-        ) from exc
-
-    except BadRequestError as exc:
-        raise RuntimeError(
-            f"The provider rejected the request. Check the model name "
-            f"and supported request parameters. Details: {exc}"
-        ) from exc
-
-    except RateLimitError as exc:
-        raise RuntimeError(
-            "ArvanCloud rate limit or account quota reached. "
-            "Check your gateway quota and try again later."
-        ) from exc
-
-    except APITimeoutError as exc:
-        raise RuntimeError(
-            "The synthesis request timed out. Try again or check "
-            "the gateway's availability."
-        ) from exc
-
-    except APIConnectionError as exc:
-        raise RuntimeError(
-            "Could not connect to the ArvanCloud gateway. "
-            "Check the base URL and network availability."
-        ) from exc
-
-    except APIStatusError as exc:
-        raise RuntimeError(
-            f"Provider returned HTTP {exc.status_code}. "
-            f"Details: {exc}"
-        ) from exc
-
-    if not response.choices:
-        raise RuntimeError("The provider returned no completion choices.")
-
-    content = response.choices[0].message.content
-
-    if not content or not content.strip():
-        raise RuntimeError(
-            "The model returned an empty response. "
-            "Try another model or check the gateway configuration."
+            "The model returned an empty response. Try another model or check the gateway configuration."
         )
+    if finish_reason == "length":
+        yield "\n\n> **Note:** The response reached the token limit and may be incomplete."
 
-    if response.choices[0].finish_reason == "length":
-        content += "\n\n> **Note:** The response reached the token limit and may be incomplete."
 
-    return content.strip()
+def call_synthesis(candidate, df, vectors, api_key, base_url, model_name, temperature, perspective):
+    """Non-streaming convenience wrapper (kept for backwards compatibility / tests)."""
+    return "".join(
+        stream_synthesis(candidate, df, vectors, api_key, base_url, model_name, temperature, perspective)
+    ).strip()
 
-def call_synthesis(
-    candidate,
-    df,
-    vectors,
-    api_key,
-    base_url,
-    model_name,
-    temperature,
-    perspective,
-):
-    from openai import (
-        OpenAI,
-        APIConnectionError,
-        APITimeoutError,
-        AuthenticationError,
-        BadRequestError,
-        NotFoundError,
-        RateLimitError,
-        APIStatusError,
-    )
-
-    # Validate configuration before making a network request.
-    api_key = (api_key or "").strip()
-    base_url = (base_url or "").strip().rstrip("/")
-    model_name = (model_name or "").strip()
-
-    if not api_key:
-        raise ValueError("API key is missing. Configure OPENAI_API_KEY in Streamlit Secrets.")
-
-    if not base_url:
-        raise ValueError("API base URL is missing. Configure OPENAI_BASE_URL.")
-
-    if not model_name:
-        raise ValueError("Model name is missing. Configure OPENAI_MODEL.")
-
-    # ArvanCloud's documented OpenAI SDK example uses this key format.
-    if not api_key.startswith("apikey "):
-        raise ValueError(
-            "The ArvanCloud API key should include its 'apikey ' prefix. "
-            "Copy the complete key from your ArvanCloud AI gateway."
-        )
-
-    # Find the six nearest original ideas to the generated candidate.
-    z = np.asarray(candidate["vector"], dtype=np.float32).reshape(1, -1)
-    sims = cosine_similarity(z, vectors)[0]
-    nearest = np.argsort(sims)[::-1][:6]
-
-    anchors = []
-    for idx in nearest:
-        row = df.iloc[int(idx)]
-        anchors.append({
-            field: row[field]
-            for field in FIELDS
-        } | {
-            "similarity": round(float(sims[idx]), 3)
-        })
-
-    prompt = f"""
-You are an interdisciplinary scientific invention researcher.
-
-Your task is to formulate one scientifically explicit research hypothesis
-inspired by a mathematical semantic-search operation.
-
-SEARCH OPERATION:
-{candidate['method']}
-
-INTELLECTUAL PERSPECTIVE:
-{perspective}
-
-NEAREST SOURCE IDEAS:
-{json.dumps(anchors, ensure_ascii=False, indent=2)}
-
-REQUIREMENTS:
-
-1. Do not merely paraphrase, combine, or concatenate the source ideas.
-2. Identify an underlying mechanism, mathematical principle, biological
-   process, control strategy, or information-processing principle.
-3. Transfer that principle into a meaningfully different target problem.
-4. Explain the causal chain connecting the transferred mechanism
-   to the proposed application.
-5. Distinguish established scientific knowledge from speculation.
-6. Explain why the proposed mechanism may be different from the source ideas.
-7. Do not claim patentability, global novelty, clinical efficacy,
-   or safety without evidence.
-8. For healthcare applications, discuss privacy, human factors,
-   clinical governance, and safety where relevant.
-9. Make the proposal technically specific rather than generic.
-
-RETURN THESE SECTIONS:
-
-# Title
-# Target Problem
-# Transferred Mechanism
-# Proposed Idea
-# Why It May Be Different
-# Scientific Basis
-# Speculative Assumptions
-# Implementation Steps (3-5 steps)
-# Risks and Safeguards
-# Validation Experiment
-# Measurable Outcomes
-# Novelty Verification Queries
-"""
-
-    client = OpenAI(
-        api_key=api_key,
-        base_url=base_url,
-        timeout=120.0,
-        max_retries=1,
-    )
-
-    try:
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Be rigorous, inventive, technically explicit, "
-                        "and transparent about scientific uncertainty."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": prompt,
-                },
-            ],
-            temperature=float(temperature),
-            max_tokens=3000,
-        )
-
-    except AuthenticationError as exc:
-        raise RuntimeError(
-            "ArvanCloud authentication failed. Check the complete API key "
-            "and its 'apikey ' prefix."
-        ) from exc
-
-    except NotFoundError as exc:
-        raise RuntimeError(
-            "The requested model or gateway endpoint was not found. "
-            "Check OPENAI_BASE_URL and OPENAI_MODEL."
-        ) from exc
-
-    except BadRequestError as exc:
-        raise RuntimeError(
-            f"The provider rejected the request. Check the model name "
-            f"and supported request parameters. Details: {exc}"
-        ) from exc
-
-    except RateLimitError as exc:
-        raise RuntimeError(
-            "ArvanCloud rate limit or account quota reached. "
-            "Check your gateway quota and try again later."
-        ) from exc
-
-    except APITimeoutError as exc:
-        raise RuntimeError(
-            "The synthesis request timed out. Try again or check "
-            "the gateway's availability."
-        ) from exc
-
-    except APIConnectionError as exc:
-        raise RuntimeError(
-            "Could not connect to the ArvanCloud gateway. "
-            "Check the base URL and network availability."
-        ) from exc
-
-    except APIStatusError as exc:
-        raise RuntimeError(
-            f"Provider returned HTTP {exc.status_code}. "
-            f"Details: {exc}"
-        ) from exc
-
-    if not response.choices:
-        raise RuntimeError("The provider returned no completion choices.")
-
-    content = response.choices[0].message.content
-
-    if not content or not content.strip():
-        raise RuntimeError(
-            "The model returned an empty response. "
-            "Try another model or check the gateway configuration."
-        )
-
-    if response.choices[0].finish_reason == "length":
-        content += "\n\n> **Note:** The response reached the token limit and may be incomplete."
-
-    return content.strip()
 
 
 def main():
@@ -709,19 +556,38 @@ def main():
             perspectives = ["Physics and control theory", "Molecular and cellular biology", "Information theory and computation",
                             "Evolutionary systems and game theory", "Hardware and human factors", "Radical assumption inversion"]
             perspective = st.selectbox("Intellectual perspective", perspectives)
-            if st.button("Synthesize scientific hypothesis", type="primary"):
+            c_run, c_test = st.columns([1, 1])
+            run_clicked = c_run.button("Synthesize scientific hypothesis", type="primary")
+            test_clicked = c_test.button("Test gateway connection")
+
+            if test_clicked:
+                try:
+                    with st.spinner("Sending a tiny test request..."):
+                        seconds = ping_gateway(api_key, base_url, model_name)
+                    st.success(f"Gateway reachable and model answered in {seconds:.1f}s.")
+                except Exception as exc:
+                    st.error(f"Gateway test failed: {exc}")
+
+            generated_now = False
+            if run_clicked:
                 if not api_key and "api.openai.com" in base_url:
                     st.error("Provide an API key or configure an OpenAI-compatible provider.")
                 else:
                     candidate = {"vector": population[selected], "method": st.session_state["population_metadata"][selected]["method"]}
+                    started = time.time()
                     try:
-                        with st.spinner("Constructing a mechanism-level hypothesis..."):
-                            proposal = call_synthesis(candidate, df, vectors, api_key, base_url, model_name, temperature, perspective)
-                        st.session_state["last_proposal"] = proposal
+                        st.caption("Waiting for the model... text appears as soon as the first tokens arrive.")
+                        proposal = st.write_stream(
+                            stream_synthesis(candidate, df, vectors, api_key, base_url, model_name, temperature, perspective)
+                        )
+                        st.session_state["last_proposal"] = str(proposal).strip()
+                        st.caption(f"Generated in {time.time() - started:.1f}s")
+                        generated_now = True
                     except Exception as exc:
-                        st.error(f"Synthesis failed: {exc}")
+                        st.error(f"Synthesis failed after {time.time() - started:.0f}s: {exc}")
             if st.session_state.get("last_proposal"):
-                st.markdown(st.session_state["last_proposal"])
+                if not generated_now:  # when just generated, write_stream already displayed it
+                    st.markdown(st.session_state["last_proposal"])
                 st.download_button("Download hypothesis (.md)", st.session_state["last_proposal"], "scientific_hypothesis.md", "text/markdown")
 
     with tab_method:
